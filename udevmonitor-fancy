@@ -1,0 +1,189 @@
+#!/usr/bin/python3
+# pylint: disable=invalid-name
+# vim: sts=4 sw=4 et
+
+# pylint: enable=invalid-name
+
+import argparse
+import asyncio
+import logging
+import signal
+
+import colorlog
+import pyudev
+
+
+list_properties = {'DEVLINKS'}
+uninteresting_properties = {'ACTION'}
+
+
+def setup_logging():
+    logging.basicConfig()
+
+    for name, fmt in (
+            ('add', '{green}{name}{reset} {message}'),
+            ('change', '{yellow}{name}{reset} {message}'),
+            ('remove', '{red}{name}{reset} {message}')):
+        logger = logging.getLogger(name)
+        stream = logging.StreamHandler()
+        stream.setFormatter(colorlog.ColoredFormatter(fmt, style='{'))
+        logger.addHandler(stream)
+        logger.propagate = False
+
+    logging.getLogger().setLevel(logging.DEBUG)
+    logging.getLogger('asyncio').setLevel(logging.WARNING)
+
+
+def get_property(device, key):
+    if key in list_properties:
+        return device.properties[key].split()
+    else:
+        return device.properties[key]
+
+
+def iter_properties(device):
+    for key in device.properties:
+        if key in uninteresting_properties:
+            continue
+        else:
+            yield key
+
+
+def print_add(device, propertycache):
+    newprops = {}
+    for key in iter_properties(device):
+        value = get_property(device, key)
+        newprops[key] = value
+        print_item(key, value)
+    propertycache[device.sys_path] = newprops
+
+
+def print_change(device, propertycache):
+    oldprops = propertycache.get(device.sys_path)
+    newprops = {}
+
+    for key in iter_properties(device):
+        newprops[key] = get_property(device, key)
+    propertycache[device.sys_path] = newprops
+
+    if oldprops is None:
+        print_add(device, propertycache)
+        return
+
+    oldpropsset = set(oldprops)
+    newpropsset = set(newprops)
+
+    for key in sorted(oldpropsset | newpropsset):
+        oldval = oldprops.get(key)
+        newval = newprops.get(key)
+
+        if oldval is not None and newval is not None and newval != oldval:
+            if isinstance(newval, list) and sorted(oldval) == sorted(newval):
+                print_item(key, newval, end='')
+                print(' (new order)')
+            elif isinstance(newval, list) and newval:
+                print_list_change(key, oldval, newval)
+            else:
+                print('-{}={}'.format(key, oldval))
+                print('+{}={}'.format(key, newval))
+        elif oldval is None and newval is not None:
+            print_item(key, newval, prefix='+')
+        elif newval is None and oldval is not None:
+            print_item(key, oldval, prefix='-')
+
+
+def print_list_change(key, oldlist, newlist):
+    print('{}=['.format(key))
+    oldset = set(oldlist)
+    newset = set(newlist)
+    for item in oldlist:
+        if item not in newset:
+            print('  -{}'.format(item))
+    for item in newlist:
+        if item not in oldset:
+            print('  +{}'.format(item))
+    print(']')
+
+
+def print_item(key, value, *, prefix='', end='\n'):
+    if isinstance(value, str):
+        print('{}{}={}'.format(prefix, key, value), end=end)
+        return
+
+    try:
+        next(iter(value))
+    except StopIteration:
+        print('{}{}={}'.format(prefix, key, list(value)), end=end)
+    else:
+        print('{}{}=['.format(prefix, key))
+        for item in value:
+            print('   {}'.format(item))
+        print(']', end=end)
+
+
+def on_uevent(action, device, source, propertycache):
+    logging.getLogger(action).info('%s %s (%s)', source, device.sys_path, device.subsystem)
+
+    if action == 'add':
+        print_add(device, propertycache)
+    elif action == 'change':
+        print_change(device, propertycache)
+    elif action == 'remove':
+        try:
+            del propertycache[device.sys_path]
+        except KeyError:
+            pass
+
+    print()
+
+
+def reader(monitor, source, propertycache):
+    action, device = monitor.receive_device()
+    on_uevent(action, device, source, propertycache)
+
+
+def signal_handler(signal_name):
+    logging.info('got %s', signal_name)
+    asyncio.get_event_loop().stop()
+
+
+def parse_args(args=None):
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('-k', '--kernel', action='store_true')
+    parser.add_argument('-u', '--udev', action='store_true')
+    return parser.parse_args(args)
+
+
+def main():
+    setup_logging()
+    context = pyudev.Context()
+    args = parse_args()
+    loop = asyncio.get_event_loop()
+
+    if not (args.kernel or args.udev):
+        args.udev = True
+
+    if args.kernel:
+        kernel_monitor = pyudev.Monitor.from_netlink(context, 'kernel')
+        kernel_propertycache = {}
+        loop.add_reader(kernel_monitor, reader, kernel_monitor, 'kernel', kernel_propertycache)
+        kernel_monitor.start()
+
+    if args.udev:
+        udev_monitor = pyudev.Monitor.from_netlink(context, 'udev')
+        udev_propertycache = {}
+        loop.add_reader(udev_monitor, reader, udev_monitor, 'udev', udev_propertycache)
+        udev_monitor.start()
+
+    loop.add_signal_handler(signal.SIGINT, signal_handler, 'SIGINT')
+    loop.add_signal_handler(signal.SIGTERM, signal_handler, 'SIGTERM')
+
+    del args
+
+    loop.run_forever()
+    loop.close()
+    logging.shutdown()
+
+
+if __name__ == '__main__':
+    main()
