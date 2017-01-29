@@ -70,10 +70,7 @@ def print_change(device, propertycache):
         print_add(device, propertycache)
         return
 
-    oldpropsset = set(oldprops)
-    newpropsset = set(newprops)
-
-    for key in sorted(oldpropsset | newpropsset):
+    for key in sorted(oldprops.keys() | newprops.keys()):
         oldval = oldprops.get(key)
         newval = newprops.get(key)
 
